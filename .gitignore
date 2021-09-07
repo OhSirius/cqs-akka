@@ -2,3 +2,8 @@
 /project/target/
 /target/
 /target/scala-2.12/classes/
+
+# Scala-IDE specific
+.scala_dependencies
+.worksheet
+.idea 
