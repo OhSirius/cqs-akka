@@ -3,7 +3,16 @@ import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
 import akka.actor.typed.{ActorSystem, Props, _}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
-import akka_typed.TypedCalculatorWriteSide.{Add, Command, Divide, Multiply}
+import akka_typed.TypedCalculatorWriteSide.{
+  Add,
+  Added,
+  Command,
+  Divide,
+  Divided,
+  Event,
+  Multiplied,
+  Multiply
+}
 import akka.NotUsed
 import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
 import akka.actor.typed.{ActorSystem, Props, _}
@@ -13,22 +22,14 @@ import akka.persistence.query.{EventEnvelope, PersistenceQuery}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
 import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.Source
+import akka.stream.scaladsl.{Sink, Source}
 import akka.actor.typed.ActorSystem
 import akka.actor.typed.scaladsl.Behaviors
+import akka.stream.alpakka.slick.scaladsl.{Slick, SlickSession}
 import akka_typed.CalculatorRepository.{
   getLatestOffsetAndResult,
   initDataBase,
   updateResultAndOfsset
-}
-import akka_typed.TypedCalculatorWriteSide.{
-  Add,
-  Added,
-  Command,
-  Divide,
-  Divided,
-  Multiplied,
-  Multiply
 }
 
 import scala.concurrent.duration._
@@ -122,6 +123,7 @@ object akka_typed {
     initDataBase
 
     implicit val materializer            = system.classicSystem
+    implicit val ec                      = system.executionContext
     var (offset, latestCalculatedResult) = getLatestOffsetAndResult
     val startOffset: Int                 = if (offset == 1) 1 else offset + 1
 
@@ -138,6 +140,8 @@ object akka_typed {
       * Результат выполненного д.з. необходимо оформить либо на github gist либо PR к текущему репозиторию.
       */
 
+    implicit val session = SlickSession.forConfig("sink.postgres")
+    import session.profile.api._
     val source: Source[EventEnvelope, NotUsed] = readJournal
       .eventsByPersistenceId("001", startOffset, Long.MaxValue)
 
@@ -146,25 +150,34 @@ object akka_typed {
         println(x.toString())
         x
       }
-      .runForeach { event =>
-        event.event match {
-          case Added(_, amount) =>
-//          println(s"!Before Log from Added: $latestCalculatedResult")
-            latestCalculatedResult += amount
-            updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-            println(s"! Log from Added: $latestCalculatedResult")
-          case Multiplied(_, amount) =>
-//          println(s"!Before Log from Multiplied: $latestCalculatedResult")
-            latestCalculatedResult *= amount
-            updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-            println(s"! Log from Multiplied: $latestCalculatedResult")
-          case Divided(_, amount) =>
-//          println(s"! Log from Divided before: $latestCalculatedResult")
-            latestCalculatedResult /= amount
-            updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
-            println(s"! Log from Divided: $latestCalculatedResult")
-        }
+      .map(e => (e.sequenceNr, e.event))
+      .collectType[(Long, Event)]
+      .map({
+        case (sequenceNr, Added(_, amount)) =>
+          latestCalculatedResult += amount
+          (latestCalculatedResult, sequenceNr)
+        case (sequenceNr, Multiplied(_, amount)) =>
+          latestCalculatedResult *= amount
+          (latestCalculatedResult, sequenceNr)
+        case (sequenceNr, Divided(_, amount)) =>
+          latestCalculatedResult /= amount
+          (latestCalculatedResult, sequenceNr)
+      })
+      .async
+      .via(
+        Slick
+          .flowWithPassThrough(info =>
+            (sqlu"update public.result set calculated_value = ${info._2}, write_side_offset = ${info._1} where id = 1")
+              .map { updatedCount =>
+                (updatedCount, info)
+              }
+          )
+      )
+      .map { info =>
+        println(s"Updated: ${info._1 > 0} with Id ${info._2._2} and state ${info._2._1}")
+        info
       }
+      .runWith(Sink.ignore)
   }
 
   object CalculatorRepository {
@@ -211,9 +224,9 @@ object akka_typed {
     Behaviors.setup { ctx =>
       val writeActorRef = ctx.spawn(TypedCalculatorWriteSide(), "Calculato", Props.empty)
 
-//      writeActorRef ! Add(10)
-//      writeActorRef ! Multiply(2)
-//      writeActorRef ! Divide(5)
+      writeActorRef ! Add(10)
+      writeActorRef ! Multiply(2)
+      writeActorRef ! Divide(5)
 
       // 0 + 10 = 10
       // 10 * 2 = 20
